@@ -274,6 +274,7 @@ HRESULT dxgi_swap_chain_present_hook::operator()(dxgi_swap_chain_present_t origi
         );
 
         LOG(" --- 10");
+        io.Fonts->Build();
         ImGui_ImplDX12_CreateDeviceObjects();
 
         LOG(" --- 11");
@@ -298,7 +299,7 @@ HRESULT dxgi_swap_chain_present_hook::operator()(dxgi_swap_chain_present_t origi
         LOG(" --- DX12 ImGui initialized successfully");
     }
 
-    if (/* dx12.show_ui && */ dx12.command_queue && dx12.initialized)
+    if (dx12.show_ui && dx12.command_queue && dx12.initialized)
     {
         ImGui_ImplDX12_NewFrame();
         ImGui_ImplWin32_NewFrame();
