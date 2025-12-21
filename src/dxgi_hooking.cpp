@@ -1,16 +1,8 @@
 ﻿#include "dxgi_hooking.h"
 
 #include <dxgi.h>
-#include <dxgi1_2.h>
-#include <dxgi1_3.h>
-#include <dxgi1_4.h>
-#include <dxgi1_5.h>
-#include <d3d10_1.h>
-#include <d3d11.h>
-#include <d3d12.h>
-
 #include <imgui.h>
-#include <backends/imgui_impl_dx11.h>
+#include <backends/imgui_impl_dx12.h>
 #include <backends/imgui_impl_win32.h>
 
 HRESULT create_dxgi_factory_hook::operator()(create_dxgi_factory_t original, const IID& riid, void** ppFactory)
@@ -68,6 +60,8 @@ HRESULT __fastcall idxgi_factory_create_swap_chain_hook::operator()(idxgi_factor
 
     if (SUCCEEDED(hr) && ppSwapChain && *ppSwapChain)
     {
+        m_master.m_dx12.command_queue = (ID3D12CommandQueue*)pDevice;
+
         IDXGISwapChain* sc = *ppSwapChain;
         void** vtable = *(void***)(sc);
 
@@ -86,6 +80,8 @@ HRESULT __fastcall idxgi_factory1_create_swap_chain_hook::operator()(idxgi_facto
 
     if (SUCCEEDED(hr) && ppSwapChain && *ppSwapChain)
     {
+        m_master.m_dx12.command_queue = (ID3D12CommandQueue*)pDevice;
+
         IDXGISwapChain* sc = *ppSwapChain;
         void** vtable = *(void***)(sc);
 
@@ -108,6 +104,8 @@ HRESULT __fastcall idxgi_factory2_create_swap_chain_hook::operator()(
 
     if (SUCCEEDED(hr) && ppSwapChain && *ppSwapChain)
     {
+        m_master.m_dx12.command_queue = (ID3D12CommandQueue*)pDevice;
+
         IDXGISwapChain* sc = *ppSwapChain;
         void** vtable = *(void***)(sc);
 
@@ -129,9 +127,11 @@ HRESULT __fastcall idxgi_factory2_create_swap_chain_for_hwnd_hook::operator()(
 {
     LOG(" --- factory2 -> create swap chain for hwnd");
     auto hr = original(pDevice, hWnd, pDesc, pFullscreenDesc, pRestrictToOutput, ppSwapChain);
-
+    
     if (SUCCEEDED(hr) && ppSwapChain && *ppSwapChain)
     {
+        m_master.m_dx12.command_queue = (ID3D12CommandQueue*)pDevice;
+
         IDXGISwapChain* sc = *ppSwapChain;
         void** vtable = *(void***)(sc);
         void* present_addr = vtable[8];
@@ -156,6 +156,8 @@ HRESULT __fastcall idxgi_factory2_create_swap_chain_for_core_window_hook::operat
 
     if (SUCCEEDED(hr) && ppSwapChain && *ppSwapChain)
     {
+        m_master.m_dx12.command_queue = (ID3D12CommandQueue*)pDevice;
+
         IDXGISwapChain* sc = *ppSwapChain;
         void** vtable = *(void***)(sc);
 
@@ -179,6 +181,8 @@ HRESULT __fastcall idxgi_factory2_create_swap_chain_for_composition_hook::operat
 
     if (SUCCEEDED(hr) && ppSwapChain && *ppSwapChain)
     {
+        m_master.m_dx12.command_queue = (ID3D12CommandQueue*)pDevice;
+
         IDXGISwapChain* sc = *ppSwapChain;
         void** vtable = *(void***)(sc);
 
@@ -190,62 +194,148 @@ HRESULT __fastcall idxgi_factory2_create_swap_chain_for_composition_hook::operat
     return hr;
 }
 
-
-HWND hwnd = NULL;
-ID3D12Device* device;
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
-HRESULT dxgi_swap_chain_present_hook::operator()(dxgi_swap_chain_present_t original, IDXGISwapChain* self, UINT SyncInterval, UINT Flags)
+HRESULT dxgi_swap_chain_present_hook::operator()(dxgi_swap_chain_present_t original, IDXGISwapChain3* self, UINT SyncInterval, UINT Flags)
 {
-    auto hr = original(self, SyncInterval, Flags);
-    if (FAILED(hr))
-        return hr;
+    auto& dx12 = m_master.m_dx12;
 
-    if (hwnd == NULL)
+    if (!dx12.initialized && dx12.command_queue)
     {
-		LOG(" --- trying to find window");
-        hwnd = FindWindowA("UnrealWindow", "S.T.A.L.K.E.R. 2: Heart of Chornobyl  ");
-        if (NULL == hwnd)
-        {
-            LOG(" xxx Failed to find window!");
-            hwnd = GetForegroundWindow();
-            return hr;
+        IMGUI_CHECKVERSION();
+        ImGui::CreateContext();
+        ImGuiIO& io = ImGui::GetIO();
+        io.MouseDrawCursor = true;
+
+        LOG(" --- Initializing DX12 ImGui");
+
+        DXGI_SWAP_CHAIN_DESC swap_chain_desc;
+        self->GetDevice(__uuidof(ID3D12Device), (void**)&dx12.device);
+        self->GetDesc(&swap_chain_desc);
+        self->GetHwnd(&dx12.hwnd);
+        swap_chain_desc.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
+        swap_chain_desc.OutputWindow = dx12.hwnd;
+        swap_chain_desc.Windowed = ((GetWindowLongPtr(dx12.hwnd, GWL_STYLE) & WS_POPUP) != 0) ? false : true;
+
+        dx12.buffer_count = swap_chain_desc.BufferCount;
+        dx12.frame_ctx = (frame_context*)calloc(dx12.buffer_count, sizeof(frame_context));
+
+        D3D12_DESCRIPTOR_HEAP_DESC srv_desc = {};
+        srv_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        srv_desc.NumDescriptors = dx12.buffer_count;
+        srv_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+
+        dx12.device->CreateDescriptorHeap(&srv_desc, IID_PPV_ARGS(&dx12.srv_heap));
+
+        ID3D12CommandAllocator* allocator;
+        dx12.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator));
+        for (size_t i = 0; i < dx12.buffer_count; i++) {
+            dx12.frame_ctx[i].command_allocator = allocator;
         }
 
-        void* wnd_proc = reinterpret_cast<void*>(GetWindowLongPtrW(hwnd, GWLP_WNDPROC));
-        if (NULL == wnd_proc)
-            LOG(" xxx Failed to get window procedure!");
+        dx12.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator, NULL, IID_PPV_ARGS(&dx12.command_list));
 
-        m_master.m_hk.add_hook<WND_PROC>(
-            (uintptr_t)wnd_proc,
-            [](WNDPROC original, HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) -> LRESULT
-            {
-                // LOG(" --- window proc");
+        LOG(" --- 4");
+        D3D12_DESCRIPTOR_HEAP_DESC rtv_desc = {};
+        rtv_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+        rtv_desc.NumDescriptors = dx12.buffer_count;
+        rtv_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+        rtv_desc.NodeMask = 1;
 
-				auto result = original(hWnd, msg, wParam, lParam);
+        LOG(" --- 5");
+        dx12.device->CreateDescriptorHeap(&rtv_desc, IID_PPV_ARGS(&dx12.rtv_heap));
 
-                if (result)
-					return result;
+        LOG(" --- 6");
+        UINT rtv_size = dx12.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle = dx12.rtv_heap->GetCPUDescriptorHandleForHeapStart();
 
-                if (hWnd != hwnd)
-                    return result;
-
-                ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam);
-			});
-        LOG(" --- found window & hooked window");
-    }
-
-    if (!device) {
-        LOG(" --- trying to init dx12 imgui");
-
-        HRESULT hr = self->GetDevice(__uuidof(ID3D12Device),  (void**)&device);
-        if (SUCCEEDED(hr) && device != nullptr)
+        LOG(" --- 7");
+        for (UINT i = 0; i < dx12.buffer_count; i++)
         {
-            LOG("SUCCESS: swapchain is backed by dx12");
+            ID3D12Resource* back_buffer = nullptr;
+            dx12.frame_ctx[i].rtv_handle = rtv_handle;
+            self->GetBuffer(i, IID_PPV_ARGS(&back_buffer));
+            dx12.device->CreateRenderTargetView(back_buffer, nullptr, rtv_handle);
+            dx12.frame_ctx[i].back_buffer = back_buffer;
+            rtv_handle.ptr += rtv_size;
         }
+
+        LOG(" --- 8");
+        ImGui_ImplWin32_Init(dx12.hwnd);
+
+        LOG(" --- 9");
+        ImGui_ImplDX12_Init(
+            dx12.device,
+            dx12.buffer_count,
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            dx12.srv_heap,
+            dx12.srv_heap->GetCPUDescriptorHandleForHeapStart(),
+            dx12.srv_heap->GetGPUDescriptorHandleForHeapStart()
+        );
+
+        LOG(" --- 10");
+        ImGui_ImplDX12_CreateDeviceObjects();
+
+        LOG(" --- 11");
+        void* wnd_proc = (void*)GetWindowLongPtrW(dx12.hwnd, GWLP_WNDPROC);
+        if (wnd_proc && !m_master.m_hk.has_hook(WND_PROC))
+        {
+            m_master.m_hk.add_hook<WND_PROC>(
+                (uintptr_t)wnd_proc,
+                [&dx12](WNDPROC orig, HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) -> LRESULT {
+                    if (wParam == VK_OEM_MINUS)
+                    {
+                        dx12.show_ui = !dx12.show_ui;
+                        return true;
+                    }
+                    if (dx12.show_ui && ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam))
+                        return true;
+                    return orig(hWnd, msg, wParam, lParam);
+                });
+        }
+
+        dx12.initialized = true;
+        LOG(" --- DX12 ImGui initialized successfully");
     }
 
-    return hr;
+    if (/* dx12.show_ui && */ dx12.command_queue && dx12.initialized)
+    {
+        ImGui_ImplDX12_NewFrame();
+        ImGui_ImplWin32_NewFrame();
+        ImGui::NewFrame();
+
+        ImGui::ShowDemoWindow();
+
+        UINT frame_idx = self->GetCurrentBackBufferIndex();
+        frame_context& ctx = dx12.frame_ctx[frame_idx];
+        ctx.command_allocator->Reset();
+
+        D3D12_RESOURCE_BARRIER barrier = {};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+        barrier.Transition.pResource = ctx.back_buffer;
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+
+        dx12.command_list->Reset(ctx.command_allocator, nullptr);
+        dx12.command_list->ResourceBarrier(1, &barrier);
+        dx12.command_list->OMSetRenderTargets(1, &ctx.rtv_handle, FALSE, nullptr);
+        dx12.command_list->SetDescriptorHeaps(1, &dx12.srv_heap);
+
+        ImGui::Render();
+        ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), dx12.command_list);
+
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+
+        dx12.command_list->ResourceBarrier(1, &barrier);
+        dx12.command_list->Close();
+
+        dx12.command_queue->ExecuteCommandLists(1, reinterpret_cast<ID3D12CommandList* const*>(&dx12.command_list));
+    }
+
+    return original(self, SyncInterval, Flags);
 }
 
 void dxgi_hooking::create_f2_hooks(IUnknown* factory)

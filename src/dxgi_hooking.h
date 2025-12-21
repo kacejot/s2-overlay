@@ -1,10 +1,53 @@
 ﻿#pragma once
 #include <Windows.h>
-#include <dxgi1_2.h>
+#include <dxgi1_4.h>
+#include <d3d12.h>
 #include <cstdint>
 
 #include "hooking.h"
 #include "log.h"
+
+struct frame_context
+{
+    ID3D12CommandAllocator*     command_allocator = nullptr;
+    ID3D12Resource*             back_buffer = nullptr;
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle = {};
+};
+
+struct dx12_state
+{
+    ID3D12Device*               device = nullptr;
+    ID3D12CommandQueue*         command_queue = nullptr;
+    ID3D12DescriptorHeap*       rtv_heap = nullptr;
+    ID3D12DescriptorHeap*       srv_heap = nullptr;
+    ID3D12GraphicsCommandList*  command_list = nullptr;
+    frame_context*              frame_ctx = nullptr;
+	HWND 					    hwnd = NULL;
+    UINT                        buffer_count = 0;
+    bool                        initialized = false;
+    bool                        show_ui = true;
+
+    void cleanup()
+    {
+        if (frame_ctx)
+        {
+            if (frame_ctx[0].command_allocator)
+                frame_ctx[0].command_allocator->Release();
+            for (UINT i = 0; i < buffer_count; i++)
+            {
+                if (frame_ctx[i].back_buffer)
+                    frame_ctx[i].back_buffer->Release();
+            }
+            free(frame_ctx);
+            frame_ctx = nullptr;
+        }
+        if (command_list) { command_list->Release(); command_list = nullptr; }
+        if (srv_heap) { srv_heap->Release(); srv_heap = nullptr; }
+        if (rtv_heap) { rtv_heap->Release(); rtv_heap = nullptr; }
+        if (command_queue) { command_queue->Release(); command_queue = nullptr; }
+        if (device) { device->Release(); device = nullptr; }
+    }
+};
 
 enum function_id_t : uint64_t
 {
@@ -182,8 +225,8 @@ private:
     dxgi_hooking& m_master;
 };
 
-using on_present_t = std::function<void(IDXGISwapChain*, UINT, UINT)>;
-using dxgi_swap_chain_present_t = HRESULT(*)(IDXGISwapChain* self, UINT SyncInterval, UINT Flags);
+using on_present_t = std::function<void(IDXGISwapChain3*, UINT, UINT)>;
+using dxgi_swap_chain_present_t = HRESULT(*)(IDXGISwapChain3* self, UINT SyncInterval, UINT Flags);
 
 class dxgi_swap_chain_present_hook
 {
@@ -192,7 +235,7 @@ public:
     {
 	}
 
-    HRESULT operator()(dxgi_swap_chain_present_t original, IDXGISwapChain* self, UINT SyncInterval, UINT Flags);
+    HRESULT operator()(dxgi_swap_chain_present_t original, IDXGISwapChain3* self, UINT SyncInterval, UINT Flags);
 
 private:
 	dxgi_hooking& m_master;
@@ -219,7 +262,8 @@ public:
 	}
 
     void init();
-
+    bool check(void* addr, function_id_t id);
+    void create_f2_hooks(IUnknown* factory);
     template <function_id_t id, typename fn, typename hook_t>
     bool try_add_hook_by_name(const char* fn_name, hook_t&& hook);
 
@@ -236,9 +280,7 @@ public:
 	idxgi_factory2_create_swap_chain_for_core_window_hook idxgi_factory2_create_swap_chain_for_core_window;
 	idxgi_factory2_create_swap_chain_for_composition_hook idxgi_factory2_create_swap_chain_for_composition;
 	dxgi_swap_chain_present_hook dxgi_swap_chain_present;
-    
-    bool check(void* addr, function_id_t id);
-    void create_f2_hooks(IUnknown* factory);
+    dx12_state m_dx12;
 
 private:
     bool is_inside_module(void* addr);

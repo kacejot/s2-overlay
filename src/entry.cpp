@@ -4,10 +4,8 @@
 #include <filesystem>
 #include <array>
 
-struct master
-{
-	master(HMODULE dxgi_handle) : hk(0), dxgi(hk, dxgi_handle)
-    {
+struct master {
+	master(HMODULE dxgi_handle) : hk(), dxgi(hk, dxgi_handle) {
         hk.init();
 		dxgi.init();
     }
@@ -20,19 +18,16 @@ std::unique_ptr<master> g_master;
 
 HMODULE find_handle();
 
-extern "C" void init_plugin(HMODULE h_module)
-{
+extern "C" void init_plugin(HMODULE h_module) {
     g_master = std::make_unique<master>(find_handle());
 }
 
-extern "C" void deinit_plugin()
-{
+extern "C" void deinit_plugin() {
     g_master.reset();
 }
 
-HMODULE find_handle()
-{
-    std::array<char, MAX_PATH> buf;
+HMODULE find_handle() {
+    std::array<char, MAX_PATH> buf{};
     if (GetSystemDirectoryA(buf.data(), buf.size()) == 0) {
         return NULL;
     }
